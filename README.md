@@ -1,6 +1,6 @@
 # Stereonet Dash (SMTI Comparison)
 
-Interactive Dash app to compare left-side P/T/B axes against right-side E (strain) or S (stress) axes on dual stereonets.
+Interactive Dash app to compare left-side P/B/T axes against right-side E (strain) or S (stress) axes on dual stereonets.
 
 This README is written for:
 1. Power users and programmers who will run or extend the app.
@@ -10,7 +10,7 @@ This README is written for:
 
 **What This App Does**
 - Loads a CSV and plots two stereonets side by side.
-- Left panel: P/T/B axes (trend/plunge).
+- Left panel: P/B/T axes (trend/plunge).
 - Right panel: E or S axes (trend/plunge), selectable if both exist.
 - Computes an orthonormal average triad via joint eigen/SVD.
 - Provides rotation sliders and buttons to align right axes to left.
@@ -64,7 +64,7 @@ Notes:
 **2) Rotation Controls**
 - Right-hand sliders represent **delta rotations**.
 - `0, 0` means **no rotation** (original right data).
-- Default slider values are set to the **best-fit alignment** that moves E/S axes into the P/T/B frame.
+- Default slider values are set to the **best-fit alignment** that moves E/S axes into the P/B/T frame.
 - **No Rotation** resets to `0, 0`. **Best Fit** resets to the computed best-fit deltas.
 
 **3) Projection**
@@ -109,7 +109,7 @@ Notes:
 **Design Invariants (Do Not Break)**
 - Sliders represent **delta rotation** only.
 - `0,0` must always show the **original right dataset**.
-- Default slider values must align E/S averages to P/T/B averages.
+- Default slider values must align E/S averages to P/B/T averages.
 - Use lower-hemisphere points only.
 - Keep 1:1 stereonet aspect ratio.
 - No default CSV; user must upload.

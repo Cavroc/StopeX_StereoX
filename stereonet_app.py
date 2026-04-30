@@ -25,6 +25,8 @@ PANEL_WIDTH = int(NET_WIDTH * (1 - H_SPACING) / 2)
 LEGEND_COLS = 4
 LEGEND_ENTRY_WIDTH = 1 / LEGEND_COLS
 LEGEND_ENTRY_WIDTH_MODE = 'fraction'
+RIGHT_AXIS_COLORS = ['#8ab7e0', '#7fd39a', '#f6c56f']  # P, B, T
+RIGHT_AXIS_RANKS = {1: 30, 2: 70, 3: 110}
 
 # -------------------------
 # Helper geometry functions
@@ -723,7 +725,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     right_rot = rotation_from_pole_equator(target_pole_vec, target_equator)
     if right_rot is None:
         right_rot = np.eye(3)
-    # Prepare left dataset (P, T, B axes as lines)
+    # Prepare left dataset (P, B, T axes as lines)
     p_trend = to_numeric_series(df, LEFT_COLS["p_trend"])
     p_plunge = to_numeric_series(df, LEFT_COLS["p_plunge"])
     t_trend = to_numeric_series(df, LEFT_COLS["t_trend"])
@@ -828,7 +830,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     fig = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=("P/T/B Axes (Trends/Plunges)", f"{right_title} (Trends/Plunges)"),
+        subplot_titles=("P/B/T Axes (Trends/Plunges)", f"{right_title} (Trends/Plunges)"),
         horizontal_spacing=H_SPACING
     )
     # common background circle for stereonet
@@ -881,7 +883,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     add_rotated_grid(grid_rot_left, row=1, col=1)
     add_rotated_grid(grid_rot_right, row=1, col=2)
 
-    # Left: P/T/B axes
+    # Left: P/B/T axes
     fig.add_trace(go.Scatter(x=circle_x, y=circle_y, mode='lines', line=dict(color='black'), showlegend=False), row=1, col=1)
     fig.add_trace(go.Scatter(x=x_p, y=y_p, mode='markers', marker=dict(size=6, color='#1f77b4', opacity=0.7),
                              name='P-Axis', legendrank=10), row=1, col=1)
@@ -893,10 +895,10 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     right_label = right_mode or DEFAULT_RIGHT_MODE
     # Right: EDip/SDip points
     fig.add_trace(go.Scatter(x=circle_x, y=circle_y, mode='lines', line=dict(color='black'), showlegend=False), row=1, col=2)
-    colors = ['#8ab7e0', '#f6c56f', '#7fd39a']
+    colors = RIGHT_AXIS_COLORS
     for idx, (dipdir_col, dip_col, _, _, _, x, y) in enumerate(right_sets, start=1):
         label = f"{right_label}{idx}"
-        rank = {1: 30, 2: 70, 3: 110}.get(idx, 200 + idx)
+        rank = RIGHT_AXIS_RANKS.get(idx, 200 + idx)
         fig.add_trace(go.Scatter(x=x, y=y, mode='markers',
                                  marker=dict(size=6, color=colors[idx-1], opacity=0.7),
                                  name=label,
@@ -926,7 +928,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
         for idx, v in enumerate(e_avg_rot, start=1):
             tr, pl = vector_to_trend_plunge(*v)
             x, y = equal_area_proj(tr, pl, rotation_deg=rotation)
-            rank = {1: 40, 2: 80, 3: 120}.get(idx, 240 + idx)
+            rank = (RIGHT_AXIS_RANKS.get(idx, 200 + idx) + 10)
             fig.add_trace(go.Scatter(x=[x], y=[y], mode='markers',
                                      marker=dict(size=avg_marker_size, color=colors[idx-1], symbol='circle', line=avg_marker_line),
                                      name=f"{right_label}{idx} Avg",
