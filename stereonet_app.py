@@ -34,13 +34,15 @@ RIGHT_AXIS_COLORS = ['#8ab7e0', '#7fd39a', '#f6c56f']  # 1, 2, 3 aligned to P, B
 RIGHT_AXIS_RANKS = {1: 30, 2: 70, 3: 110}
 NET_MODE_OPTIONS = [
     {"label": "Oriented stereonet", "value": "oriented"},
-    {"label": "Normal stereonet (equator view)", "value": "normal"},
+    {"label": "Classic (Equator View)", "value": "normal"},
 ]
 DEFAULT_NET_MODE = "oriented"
-TENSOR_FIG_HEIGHT = 480
-PIE_FIG_HEIGHT = 260
-PIE_WIDTH = int(PANEL_WIDTH * 0.5)
-TENSOR_WIDTH = FIG_WIDTH - PIE_WIDTH
+BOTTOM_FIG_HEIGHT = 400
+TENSOR_FIG_HEIGHT = BOTTOM_FIG_HEIGHT
+PIE_FIG_HEIGHT = BOTTOM_FIG_HEIGHT
+PIE_WIDTH = int(FIG_WIDTH * 0.4)
+BOTTOM_GAP = 12
+TENSOR_WIDTH = FIG_WIDTH - PIE_WIDTH - BOTTOM_GAP
 IDENTITY_VIEW_MATRIX = np.eye(3)
 DISPLAY_VIEW_MATRIX = IDENTITY_VIEW_MATRIX
 ANGLE_CATEGORY_LABELS = ["None/Minor", "Moderate", "Significant", "Access not advisable"]
@@ -190,6 +192,16 @@ def orthonormalize_triad(v1, v2, v3):
     if np.linalg.det(R) < 0:
         U[:, -1] *= -1
         R = U @ Vt
+    return R[:, 0], R[:, 1], R[:, 2]
+
+def orthonormalize_axial_axes(v1, v2, v3):
+    """
+    Closest orthonormal axes for directionless poles.
+    Handedness is irrelevant for axial data, so reflections are allowed.
+    """
+    M = np.stack([v1, v2, v3], axis=1)
+    U, _, Vt = np.linalg.svd(M)
+    R = U @ Vt
     return R[:, 0], R[:, 1], R[:, 2]
 
 def force_lower_hemisphere(v):
@@ -395,6 +407,51 @@ def mean_triad_from_rows(trend_plunge_cols, ref_means=None):
     triad = [force_lower_hemisphere(v) for v in triad]
     return triad
 
+def best_fit_rotation_from_axis_pairs(left_pairs, right_pairs, max_iter=8):
+    """
+    Least-squares proper rotation from right axes to left axes.
+    The vectors are axial, so signs are iteratively chosen to minimize mismatch.
+    """
+    if len(left_pairs) != 3 or len(right_pairs) != 3:
+        return None
+
+    left_trends = [np.asarray(tp[0], dtype=float) for tp in left_pairs]
+    left_plunges = [np.asarray(tp[1], dtype=float) for tp in left_pairs]
+    right_trends = [np.asarray(tp[0], dtype=float) for tp in right_pairs]
+    right_plunges = [np.asarray(tp[1], dtype=float) for tp in right_pairs]
+    row_mask = np.ones_like(left_trends[0], dtype=bool)
+    for values in left_trends + left_plunges + right_trends + right_plunges:
+        row_mask &= np.isfinite(values)
+    if not row_mask.any():
+        return None
+
+    left_vectors = []
+    right_vectors = []
+    for left_trend, left_plunge, right_trend, right_plunge in zip(left_trends, left_plunges, right_trends, right_plunges):
+        lx, ly, lz = trend_plunge_to_vector(left_trend[row_mask], left_plunge[row_mask])
+        rx, ry, rz = trend_plunge_to_vector(right_trend[row_mask], right_plunge[row_mask])
+        left_vectors.append(np.vstack([lx, ly, lz]).T)
+        right_vectors.append(np.vstack([rx, ry, rz]).T)
+    left = np.vstack(left_vectors)
+    right = np.vstack(right_vectors)
+
+    rot = np.eye(3)
+    for _ in range(max_iter):
+        right_rot = (rot @ right.T).T
+        signs = np.where(np.sum(left * right_rot, axis=1) < 0.0, -1.0, 1.0)
+        signed_right = right * signs[:, None]
+        cov = signed_right.T @ left
+        u, _, vt = np.linalg.svd(cov)
+        next_rot = vt.T @ u.T
+        if np.linalg.det(next_rot) < 0:
+            vt[-1, :] *= -1.0
+            next_rot = vt.T @ u.T
+        if np.allclose(next_rot, rot, atol=1e-10):
+            rot = next_rot
+            break
+        rot = next_rot
+    return rot
+
 def compute_alignment_defaults(df, right_prefix):
     p_trend = to_numeric_series(df, LEFT_COLS["p_trend"])
     p_plunge = to_numeric_series(df, LEFT_COLS["p_plunge"])
@@ -402,19 +459,6 @@ def compute_alignment_defaults(df, right_prefix):
     t_plunge = to_numeric_series(df, LEFT_COLS["t_plunge"])
     b_trend = to_numeric_series(df, LEFT_COLS["b_trend"])
     b_plunge = to_numeric_series(df, LEFT_COLS["b_plunge"])
-
-    p_axial = axial_mean_direction(p_trend.to_numpy(), p_plunge.to_numpy())
-    t_axial = axial_mean_direction(t_trend.to_numpy(), t_plunge.to_numpy())
-    b_axial = axial_mean_direction(b_trend.to_numpy(), b_plunge.to_numpy())
-
-    left_triad = mean_triad_from_rows(
-        [
-            (p_trend.to_numpy(), p_plunge.to_numpy()),
-            (t_trend.to_numpy(), t_plunge.to_numpy()),
-            (b_trend.to_numpy(), b_plunge.to_numpy()),
-        ],
-        ref_means=[p_axial, t_axial, b_axial],
-    )
 
     right_cols = right_cols_for_prefix(df, right_prefix)
     if right_cols is None:
@@ -427,27 +471,20 @@ def compute_alignment_defaults(df, right_prefix):
     e_trend_3 = to_numeric_series(df, right_cols[2][0])
     e_plunge_3 = to_numeric_series(df, right_cols[2][1])
 
-    e_axial = [
-        axial_mean_direction(e_trend_1.to_numpy(), e_plunge_1.to_numpy()),
-        axial_mean_direction(e_trend_2.to_numpy(), e_plunge_2.to_numpy()),
-        axial_mean_direction(e_trend_3.to_numpy(), e_plunge_3.to_numpy()),
-    ]
-
-    right_triad = mean_triad_from_rows(
+    R_align = best_fit_rotation_from_axis_pairs(
+        [
+            (p_trend.to_numpy(), p_plunge.to_numpy()),
+            (b_trend.to_numpy(), b_plunge.to_numpy()),
+            (t_trend.to_numpy(), t_plunge.to_numpy()),
+        ],
         [
             (e_trend_1.to_numpy(), e_plunge_1.to_numpy()),
             (e_trend_2.to_numpy(), e_plunge_2.to_numpy()),
             (e_trend_3.to_numpy(), e_plunge_3.to_numpy()),
         ],
-        ref_means=e_axial,
     )
-
-    if left_triad is None or right_triad is None:
+    if R_align is None:
         return 0.0, 0.0, [1.0, 0.0, 0.0]
-
-    R_left = np.stack(left_triad, axis=1)
-    R_right = np.stack(right_triad, axis=1)
-    R_align = R_left @ R_right.T
 
     pole_vec = R_align @ np.array([0.0, 0.0, -1.0])
     equator_ref = R_align @ np.array([1.0, 0.0, 0.0])
@@ -648,17 +685,19 @@ def build_angle_pie_figure(row_angles):
             labels=ANGLE_CATEGORY_LABELS,
             values=values,
             marker=dict(colors=ANGLE_CATEGORY_COLORS, line=dict(color="white", width=1)),
+            hole=0.42,
             sort=False,
             direction="clockwise",
-            textinfo="label+percent",
+            textinfo="percent",
+            textposition="inside",
             hovertemplate="%{label}<br>Rows: %{value}<br>%{percent}<extra></extra>",
         )
     )
     fig.update_layout(
         height=PIE_FIG_HEIGHT,
-        margin=dict(l=10, r=10, t=45, b=10),
-        title="Angle Difference Classes",
-        showlegend=False,
+        margin=dict(l=18, r=12, t=44, b=44),
+        title=dict(text="Angle Difference Classes", x=0.02, xanchor="left"),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.08, xanchor="left", x=0),
     )
     return fig
 
@@ -719,16 +758,16 @@ def build_tensor_figure(left_vectors, right_vectors, right_label):
     add_tensor_axis_trace(fig, right_vectors[2], RIGHT_AXIS_COLORS[2], f"Model {right_label}3", 5, True)
     fig.update_layout(
         height=TENSOR_FIG_HEIGHT,
-        margin=dict(l=20, r=20, t=50, b=20),
-        title="3D Average Axis View",
+        margin=dict(l=6, r=10, t=44, b=44),
+        title=dict(text="3D Average Axis View", x=0.02, xanchor="left"),
         scene=dict(
             xaxis=dict(visible=False, range=[-1.1, 1.1]),
             yaxis=dict(visible=False, range=[-1.1, 1.1]),
             zaxis=dict(visible=False, range=[-1.1, 1.1]),
             aspectmode="cube",
-            camera=dict(eye=dict(x=1.5, y=1.4, z=1.1)),
+            camera=dict(eye=dict(x=1.35, y=1.25, z=1.0)),
         ),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.08, xanchor="left", x=0),
     )
     return fig
 
@@ -827,7 +866,6 @@ app.layout = html.Div([
         html.Div(id='load_status', style={'marginTop':'6px', 'fontSize':'12px'}),
     ], style={'padding':'10px'}),
     html.Div([
-        html.Div(style={'width': f'{PANEL_WIDTH}px'}),
         html.Div([
             html.Label("Stereonet Mode"),
             dcc.Dropdown(
@@ -866,7 +904,9 @@ app.layout = html.Div([
                 html.Button('No Rotation', id='btn_no_rotation', n_clicks=0),
                 html.Button('Best Fit', id='btn_best_fit', n_clicks=0, style={'marginLeft':'8px'}),
             ], style={'marginTop':'10px'}),
-            html.Label("Filter Column", style={'marginTop':'12px', 'display':'block'}),
+        ], style={'width': f'{PANEL_WIDTH}px', 'padding':'10px'}),
+        html.Div([
+            html.Label("Filter Column"),
             dcc.Dropdown(
                 id='filter_column',
                 options=[],
@@ -899,12 +939,12 @@ app.layout = html.Div([
             html.Button('Remove All Filters', id='btn_clear_filters', n_clicks=0, style={'marginTop':'10px'}),
             html.Details([
                 html.Summary("How to read the oriented stereonet"),
-                html.P("Normal stereonet uses an equator-facing display projection. Oriented stereonet keeps the plotted points fixed and rotates the net grid to the average axis frame."),
+                html.P("Classic view uses an equator-facing display projection. Oriented stereonet keeps the plotted points fixed and rotates the net grid to the average axis frame."),
                 html.P("The plotted points represent the same directions in both modes. What changes is the reference frame used by the grid and the 3D average-axis view."),
                 html.P("Use Best Fit to rotate the model side toward the actual P/B/T frame, then read the angle-difference summary to see the remaining mismatch."),
             ], style={'marginTop':'12px', 'fontSize':'13px'}),
         ], style={'width': f'{PANEL_WIDTH}px', 'padding':'10px'}),
-    ], style={'display':'flex', 'width': f'{FIG_WIDTH}px'}),
+    ], style={'display':'flex', 'alignItems':'flex-start', 'width': f'{FIG_WIDTH}px'}),
     dcc.Store(id='data_store'),
     dcc.Store(id='right_align_base', data={
         "trend": BASE_ALIGN_CTX["trend"],
@@ -931,7 +971,7 @@ app.layout = html.Div([
             id='tensor_graph',
             style={'height': f'{TENSOR_FIG_HEIGHT}px', 'width': f'{TENSOR_WIDTH}px', 'minWidth': f'{TENSOR_WIDTH}px'}
         ),
-    ], style={'display':'flex', 'alignItems':'flex-start', 'width': f'{FIG_WIDTH}px', 'overflowX': 'auto'}),
+    ], style={'display':'flex', 'alignItems':'flex-start', 'gap':'12px', 'width': f'{FIG_WIDTH}px', 'overflowX': 'auto'}),
     html.Div(id='debug', style={'display':'none'})  # for debug prints if needed
 ])
 
@@ -1025,23 +1065,36 @@ def clear_filters(n_clicks):
 @app.callback(
     Output('right_trend_delta', 'value', allow_duplicate=True),
     Output('right_plunge_delta', 'value', allow_duplicate=True),
+    Output('right_align_base', 'data', allow_duplicate=True),
     Input('btn_no_rotation', 'n_clicks'),
     Input('btn_best_fit', 'n_clicks'),
     State('right_align_base', 'data'),
+    State('right_mode', 'value'),
+    State('filter_column', 'value'),
+    State('filter_values', 'value'),
+    State('filter_range', 'value'),
+    State('data_store', 'data'),
     prevent_initial_call=True,
 )
-def set_rotation_buttons(n_no, n_best, right_align_base):
+def set_rotation_buttons(n_no, n_best, right_align_base, right_mode, filter_column, filter_values, filter_range, data_store):
     if not right_align_base:
         right_align_base = {"trend": 0.0, "angle_deg": 0.0}
-    if n_no is None:
-        n_no = 0
-    if n_best is None:
-        n_best = 0
-    if n_no == 0 and n_best == 0:
-        return no_update, no_update
-    if n_no >= n_best:
-        return 0.0, 0.0
-    return float(right_align_base.get("trend", 0.0)), float(right_align_base.get("angle_deg", 0.0))
+    triggered = dash.callback_context.triggered[0]["prop_id"].split(".")[0] if dash.callback_context.triggered else None
+    if triggered == "btn_no_rotation":
+        return 0.0, 0.0, right_align_base
+    if triggered != "btn_best_fit":
+        return no_update, no_update, no_update
+
+    ctx = right_align_base
+    if right_mode and data_store:
+        try:
+            df = pd.read_json(StringIO(data_store), orient='split')
+            filtered = apply_row_filter(df, filter_column, filter_values, filter_range)
+            if filtered is not None and not filtered.empty:
+                ctx = compute_alignment_context(filtered, right_mode)
+        except Exception:
+            ctx = right_align_base
+    return float(ctx.get("trend", 0.0)), float(ctx.get("angle_deg", 0.0)), ctx
 
 @app.callback(
     Output('right_trend_delta', 'value', allow_duplicate=True),
@@ -1108,7 +1161,7 @@ def update_figure(net_mode, right_trend_delta, right_plunge_delta, right_align_b
         return empty, empty, empty, html.Div(message, style={"padding": "10px"})
     df = filtered_df
 
-    avg_method = "axis_axial"
+    avg_method = "axial_ortho"
     rotation = 0.0
 
     if right_trend_delta is None:
@@ -1195,7 +1248,7 @@ def update_figure(net_mode, right_trend_delta, right_plunge_delta, right_align_b
     else:
         p_mean = t_mean = b_mean = None
     if avg_method in ("axial_ortho", "dir_ortho") and p_mean is not None and t_mean is not None and b_mean is not None:
-        p_avg, t_avg, b_avg = orthonormalize_triad(p_mean, t_mean, b_mean)
+        p_avg, t_avg, b_avg = orthonormalize_axial_axes(p_mean, t_mean, b_mean)
         p_avg = force_lower_hemisphere(p_avg)
         t_avg = force_lower_hemisphere(t_avg)
         b_avg = force_lower_hemisphere(b_avg)
@@ -1203,13 +1256,13 @@ def update_figure(net_mode, right_trend_delta, right_plunge_delta, right_align_b
         triad = mean_triad_from_rows(
             [
                 (p_trend.to_numpy(), p_plunge.to_numpy()),
-                (t_trend.to_numpy(), t_plunge.to_numpy()),
                 (b_trend.to_numpy(), b_plunge.to_numpy()),
+                (t_trend.to_numpy(), t_plunge.to_numpy()),
             ],
-            ref_means=[p_axial, t_axial, b_axial],
+            ref_means=[p_axial, b_axial, t_axial],
         )
         if triad is not None:
-            p_avg, t_avg, b_avg = triad
+            p_avg, b_avg, t_avg = triad
 
     # Prepare right dataset (three trend/plunge pairs per row)
     right_cols = right_cols_for_prefix(df, right_mode or DEFAULT_RIGHT_MODE)
@@ -1273,7 +1326,7 @@ def update_figure(net_mode, right_trend_delta, right_plunge_delta, right_align_b
     elif avg_method in ("axial_ortho", "dir_ortho"):
         means = e_means if avg_method == "axial_ortho" else e_dir_means
         if all(v is not None for v in means):
-            e_avg[0], e_avg[1], e_avg[2] = orthonormalize_triad(means[0], means[1], means[2])
+            e_avg[0], e_avg[1], e_avg[2] = orthonormalize_axial_axes(means[0], means[1], means[2])
             e_avg = [force_lower_hemisphere(v) for v in e_avg]
     elif avg_method == "joint_eigen":
         if len(right_sets) == 3:
