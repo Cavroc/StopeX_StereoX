@@ -1529,4 +1529,5 @@ def update_figure(net_mode, right_trend_delta, right_plunge_delta, right_align_b
     return fig, angle_pie_fig, tensor_fig, angle_summary
 
 if __name__ == '__main__':
-    app.run(debug=True, port=8050)
+    port = int(os.environ.get("PORT", 8050))
+    app.run(debug=False, host="0.0.0.0", port=port)
