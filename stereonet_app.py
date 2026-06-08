@@ -25,8 +25,27 @@ PANEL_WIDTH = int(NET_WIDTH * (1 - H_SPACING) / 2)
 LEGEND_COLS = 4
 LEGEND_ENTRY_WIDTH = 1 / LEGEND_COLS
 LEGEND_ENTRY_WIDTH_MODE = 'fraction'
-RIGHT_AXIS_COLORS = ['#8ab7e0', '#7fd39a', '#f6c56f']  # P, B, T
+LEFT_AXIS_COLORS = {
+    "P": "#1f77b4",
+    "B": "#2ca02c",
+    "T": "#ff7f0e",
+}
+RIGHT_AXIS_COLORS = ['#8ab7e0', '#7fd39a', '#f6c56f']  # 1, 2, 3 aligned to P, B, T
 RIGHT_AXIS_RANKS = {1: 30, 2: 70, 3: 110}
+NET_MODE_OPTIONS = [
+    {"label": "Oriented stereonet", "value": "oriented"},
+    {"label": "Normal stereonet (equator view)", "value": "normal"},
+]
+DEFAULT_NET_MODE = "oriented"
+TENSOR_FIG_HEIGHT = 480
+PIE_FIG_HEIGHT = 260
+PIE_WIDTH = int(PANEL_WIDTH * 0.5)
+TENSOR_WIDTH = FIG_WIDTH - PIE_WIDTH
+IDENTITY_VIEW_MATRIX = np.eye(3)
+DISPLAY_VIEW_MATRIX = IDENTITY_VIEW_MATRIX
+ANGLE_CATEGORY_LABELS = ["None/Minor", "Moderate", "Significant", "Access not advisable"]
+ANGLE_CATEGORY_COLORS = ["#76c893", "#ffd166", "#f77f00", "#d62828"]
+ANGLE_CATEGORY_BINS = [15.0, 30.0, 45.0]
 
 # -------------------------
 # Helper geometry functions
@@ -265,19 +284,43 @@ def rotation_from_pole_equator(pole_vec, equator_vec):
     y_axis = np.cross(z_axis, x_axis)
     return np.stack([x_axis, y_axis, z_axis], axis=1)
 
+DISPLAY_VIEW_BASIS = rotation_from_pole_equator(
+    np.array([1.0, 0.0, 0.0]),
+    np.array([0.0, 1.0, 0.0]),
+)
+DISPLAY_VIEW_MATRIX = DISPLAY_VIEW_BASIS.T if DISPLAY_VIEW_BASIS is not None else IDENTITY_VIEW_MATRIX
+
 def radius_to_plunge(r):
     r = np.clip(r, 0.0, np.sqrt(2.0))
     return 90.0 - 2.0 * np.degrees(np.arcsin(r / np.sqrt(2.0)))
 
-def project_rotated_grid(trend_deg, plunge_deg, rotation_deg, rot_matrix):
+def vectors_to_projected_xy(v, rotation_deg=0.0, view_matrix=None):
+    if view_matrix is None:
+        view_matrix = IDENTITY_VIEW_MATRIX
+    v_view = view_matrix @ v
+    upper = v_view[2] > 0
+    if np.any(upper):
+        v_view[:, upper] *= -1.0
+    tr, pl = vector_to_trend_plunge(v_view[0], v_view[1], v_view[2])
+    return equal_area_proj(tr, pl, rotation_deg), tr, pl
+
+def trend_plunge_to_projected_xy(trend_deg, plunge_deg, rotation_deg=0.0, view_matrix=None):
+    x, y, z = trend_plunge_to_vector(trend_deg, plunge_deg)
+    projected, tr, pl = vectors_to_projected_xy(np.vstack([x, y, z]), rotation_deg, view_matrix)
+    return projected[0], projected[1], tr, pl
+
+def project_rotated_grid(trend_deg, plunge_deg, rotation_deg, rot_matrix, view_matrix=None):
     x, y, z = trend_plunge_to_vector(trend_deg, plunge_deg)
     v = np.vstack([x, y, z])
     if rot_matrix is not None:
         v = rot_matrix @ v
-    tr, pl = vector_to_trend_plunge(v[0], v[1], v[2])
+    if view_matrix is None:
+        view_matrix = IDENTITY_VIEW_MATRIX
+    v_view = view_matrix @ v
+    tr, pl = vector_to_trend_plunge(v_view[0], v_view[1], v_view[2])
     xg, yg = equal_area_proj(tr, pl, rotation_deg)
 
-    visible = v[2] <= 0
+    visible = v_view[2] <= 0
     if len(visible) < 2:
         if visible.all():
             return xg, yg
@@ -287,15 +330,15 @@ def project_rotated_grid(trend_deg, plunge_deg, rotation_deg, rot_matrix):
     ys = []
     n = len(visible)
     for i in range(n - 1):
-        zi = v[2, i]
-        zj = v[2, i + 1]
+        zi = v_view[2, i]
+        zj = v_view[2, i + 1]
         vi = visible[i]
         vj = visible[i + 1]
         if vi:
             xs.append(xg[i]); ys.append(yg[i])
         if vi != vj:
             t = zi / (zi - zj)
-            v_int = v[:, i] + t * (v[:, i + 1] - v[:, i])
+            v_int = v_view[:, i] + t * (v_view[:, i + 1] - v_view[:, i])
             tr_i, pl_i = vector_to_trend_plunge(v_int[0], v_int[1], v_int[2])
             x_int, y_int = equal_area_proj(tr_i, pl_i, rotation_deg)
             xs.append(x_int); ys.append(y_int)
@@ -431,6 +474,264 @@ def compute_alignment_context(df, right_prefix):
         "angle_deg": align_angle_deg,
     }
 
+def acute_angle_difference_deg(vec_a, vec_b):
+    a_n = safe_normalize(vec_a)
+    b_n = safe_normalize(vec_b)
+    if a_n is None or b_n is None:
+        return None
+    dot = float(np.clip(np.dot(a_n, b_n), -1.0, 1.0))
+    angle = float(np.degrees(np.arccos(dot)))
+    return min(angle, 180.0 - angle)
+
+def customdata_from_trend_plunge(trend_deg, plunge_deg, extra_deg=None):
+    cols = [
+        np.asarray(trend_deg, dtype=float),
+        np.asarray(plunge_deg, dtype=float),
+    ]
+    if extra_deg is not None:
+        cols.append(np.asarray(extra_deg, dtype=float))
+    return np.column_stack(cols)
+
+def numeric_filter_bounds(df, filter_column):
+    if filter_column is None or filter_column not in df.columns:
+        return None
+    series = df[filter_column]
+    if not pd.api.types.is_numeric_dtype(series):
+        return None
+    values = pd.to_numeric(series, errors="coerce").dropna()
+    if values.empty:
+        return None
+    return float(values.min()), float(values.max())
+
+def is_numeric_filter_column(df, filter_column):
+    return numeric_filter_bounds(df, filter_column) is not None
+
+def slider_marks(min_value, max_value):
+    if min_value == max_value:
+        return {min_value: f"{min_value:g}"}
+    midpoint = (min_value + max_value) / 2.0
+    return {
+        min_value: f"{min_value:g}",
+        midpoint: f"{midpoint:g}",
+        max_value: f"{max_value:g}",
+    }
+
+def slider_step(df, filter_column, min_value, max_value):
+    if min_value == max_value:
+        return 1
+    values = pd.to_numeric(df[filter_column], errors="coerce").dropna()
+    if not values.empty and np.allclose(values, np.round(values)):
+        return 1
+    return float((max_value - min_value) / 1000.0)
+
+def apply_row_filter(df, filter_column, filter_values=None, filter_range=None):
+    if df is None or filter_column is None or filter_column not in df.columns:
+        return df
+    if is_numeric_filter_column(df, filter_column):
+        if not filter_range or len(filter_range) != 2:
+            return df
+        values = pd.to_numeric(df[filter_column], errors="coerce")
+        lo, hi = sorted(float(v) for v in filter_range)
+        return df.loc[values.between(lo, hi, inclusive="both")].copy()
+    if not filter_values:
+        return df
+    allowed = {str(v) for v in filter_values}
+    mask = df[filter_column].map(lambda v: pd.notna(v) and str(v) in allowed)
+    return df.loc[mask].copy()
+
+def available_filter_columns(df, max_unique=100):
+    excluded = set(LEFT_COLS.values())
+    for prefix in RIGHT_PREFIXES:
+        cols = right_cols_for_prefix(df, prefix)
+        if cols is None:
+            continue
+        for dipdir_col, dip_col in cols:
+            excluded.add(dipdir_col)
+            excluded.add(dip_col)
+    options = []
+    for col in df.columns:
+        if col in excluded:
+            continue
+        bounds = numeric_filter_bounds(df, col)
+        unique = pd.unique(df[col].dropna())
+        if bounds is not None or 1 < len(unique) <= max_unique:
+            options.append({"label": col, "value": col})
+    return options
+
+def filter_value_options(df, filter_column, max_values=200):
+    if filter_column is None or filter_column not in df.columns:
+        return []
+    unique = pd.unique(df[filter_column].dropna())
+    values = sorted(unique.tolist(), key=lambda v: str(v).lower())
+    return [{"label": str(v), "value": str(v)} for v in values[:max_values]]
+
+def empty_figure(title):
+    fig = go.Figure()
+    fig.update_layout(title=title)
+    return fig
+
+def build_angle_summary(left_vectors, right_vectors, right_label, filtered_rows, total_rows):
+    axis_pairs = [
+        ("P", "1", left_vectors[0], right_vectors[0]),
+        ("B", "2", left_vectors[1], right_vectors[1]),
+        ("T", "3", left_vectors[2], right_vectors[2]),
+    ]
+    chips = []
+    angles = []
+    for left_axis, right_idx, left_vec, right_vec in axis_pairs:
+        angle = acute_angle_difference_deg(left_vec, right_vec)
+        if angle is None:
+            label = f"{left_axis} vs {right_label}{right_idx}: n/a"
+        else:
+            label = f"{left_axis} vs {right_label}{right_idx}: {angle:.1f}°"
+            angles.append(angle)
+        chips.append(
+            html.Span(
+                label,
+                style={
+                    "display": "inline-block",
+                    "marginRight": "10px",
+                    "marginBottom": "6px",
+                    "padding": "6px 10px",
+                    "border": "1px solid #c9c9c9",
+                    "borderRadius": "999px",
+                    "backgroundColor": "#f7f7f7",
+                },
+            )
+        )
+    mean_label = "Mean acute difference: n/a"
+    if angles:
+        mean_label = f"Mean acute difference: {float(np.mean(angles)):.1f}°"
+    return html.Div(
+        [
+            html.Div(
+                [
+                    html.Strong("Angle difference"),
+                    html.Span(f"  Filtered rows: {filtered_rows}/{total_rows}", style={"marginLeft": "10px", "color": "#555"}),
+                ],
+                style={"marginBottom": "8px"},
+            ),
+            html.Div(chips),
+            html.Div(mean_label, style={"marginTop": "4px", "color": "#444"}),
+        ],
+        style={"padding": "10px", "border": "1px solid #d9d9d9", "borderRadius": "6px", "backgroundColor": "#fcfcfc"},
+    )
+
+def acute_angle_difference_array(trend_a, plunge_a, trend_b, plunge_b):
+    ax, ay, az = trend_plunge_to_vector(trend_a, plunge_a)
+    bx, by, bz = trend_plunge_to_vector(trend_b, plunge_b)
+    dot = (ax * bx) + (ay * by) + (az * bz)
+    angle = np.degrees(np.arccos(np.clip(dot, -1.0, 1.0)))
+    return np.minimum(angle, 180.0 - angle)
+
+def angle_category_counts(row_angles):
+    counts = {label: 0 for label in ANGLE_CATEGORY_LABELS}
+    for angle in row_angles:
+        if not np.isfinite(angle):
+            continue
+        if angle <= ANGLE_CATEGORY_BINS[0]:
+            label = ANGLE_CATEGORY_LABELS[0]
+        elif angle <= ANGLE_CATEGORY_BINS[1]:
+            label = ANGLE_CATEGORY_LABELS[1]
+        elif angle <= ANGLE_CATEGORY_BINS[2]:
+            label = ANGLE_CATEGORY_LABELS[2]
+        else:
+            label = ANGLE_CATEGORY_LABELS[3]
+        counts[label] += 1
+    return counts
+
+def build_angle_pie_figure(row_angles):
+    counts = angle_category_counts(row_angles)
+    values = [counts[label] for label in ANGLE_CATEGORY_LABELS]
+    fig = go.Figure(
+        go.Pie(
+            labels=ANGLE_CATEGORY_LABELS,
+            values=values,
+            marker=dict(colors=ANGLE_CATEGORY_COLORS, line=dict(color="white", width=1)),
+            sort=False,
+            direction="clockwise",
+            textinfo="label+percent",
+            hovertemplate="%{label}<br>Rows: %{value}<br>%{percent}<extra></extra>",
+        )
+    )
+    fig.update_layout(
+        height=PIE_FIG_HEIGHT,
+        margin=dict(l=10, r=10, t=45, b=10),
+        title="Angle Difference Classes",
+        showlegend=False,
+    )
+    return fig
+
+def add_tensor_axis_trace(fig, vec, color, name, width, showlegend):
+    if vec is None:
+        return
+    coords = np.column_stack((-vec, vec))
+    fig.add_trace(
+        go.Scatter3d(
+            x=coords[0],
+            y=coords[1],
+            z=coords[2],
+            mode="lines+markers+text",
+            line=dict(color=color, width=width),
+            marker=dict(size=3, color=color),
+            text=["", name],
+            textposition="top center",
+            name=name,
+            showlegend=showlegend,
+            hovertemplate=(
+                "Trend: %{customdata[0]:.1f}°<br>"
+                "Plunge: %{customdata[1]:.1f}°<extra>%{fullData.name}</extra>"
+            ),
+            customdata=np.array([
+                vector_to_trend_plunge(*(-vec)),
+                vector_to_trend_plunge(*vec),
+            ]),
+        )
+    )
+
+def build_tensor_figure(left_vectors, right_vectors, right_label):
+    fig = go.Figure()
+    cube_edges = [
+        ((-1, -1, -1), (1, -1, -1)), ((-1, 1, -1), (1, 1, -1)),
+        ((-1, -1, 1), (1, -1, 1)), ((-1, 1, 1), (1, 1, 1)),
+        ((-1, -1, -1), (-1, 1, -1)), ((1, -1, -1), (1, 1, -1)),
+        ((-1, -1, 1), (-1, 1, 1)), ((1, -1, 1), (1, 1, 1)),
+        ((-1, -1, -1), (-1, -1, 1)), ((1, -1, -1), (1, -1, 1)),
+        ((-1, 1, -1), (-1, 1, 1)), ((1, 1, -1), (1, 1, 1)),
+    ]
+    for start, end in cube_edges:
+        fig.add_trace(
+            go.Scatter3d(
+                x=[start[0], end[0]],
+                y=[start[1], end[1]],
+                z=[start[2], end[2]],
+                mode="lines",
+                line=dict(color="rgba(140,140,140,0.25)", width=2),
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        )
+    add_tensor_axis_trace(fig, left_vectors[0], LEFT_AXIS_COLORS["P"], "Actual P", 8, True)
+    add_tensor_axis_trace(fig, left_vectors[1], LEFT_AXIS_COLORS["B"], "Actual B", 8, True)
+    add_tensor_axis_trace(fig, left_vectors[2], LEFT_AXIS_COLORS["T"], "Actual T", 8, True)
+    add_tensor_axis_trace(fig, right_vectors[0], RIGHT_AXIS_COLORS[0], f"Model {right_label}1", 5, True)
+    add_tensor_axis_trace(fig, right_vectors[1], RIGHT_AXIS_COLORS[1], f"Model {right_label}2", 5, True)
+    add_tensor_axis_trace(fig, right_vectors[2], RIGHT_AXIS_COLORS[2], f"Model {right_label}3", 5, True)
+    fig.update_layout(
+        height=TENSOR_FIG_HEIGHT,
+        margin=dict(l=20, r=20, t=50, b=20),
+        title="3D Average Axis View",
+        scene=dict(
+            xaxis=dict(visible=False, range=[-1.1, 1.1]),
+            yaxis=dict(visible=False, range=[-1.1, 1.1]),
+            zaxis=dict(visible=False, range=[-1.1, 1.1]),
+            aspectmode="cube",
+            camera=dict(eye=dict(x=1.5, y=1.4, z=1.1)),
+        ),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="left", x=0),
+    )
+    return fig
+
 # -------------------------
 # Data load
 # -------------------------
@@ -528,6 +829,13 @@ app.layout = html.Div([
     html.Div([
         html.Div(style={'width': f'{PANEL_WIDTH}px'}),
         html.Div([
+            html.Label("Stereonet Mode"),
+            dcc.Dropdown(
+                id='net_mode',
+                options=NET_MODE_OPTIONS,
+                value=DEFAULT_NET_MODE,
+                clearable=False,
+            ),
             html.Label("Right Dataset"),
             dcc.Dropdown(
                 id='right_mode',
@@ -558,6 +866,43 @@ app.layout = html.Div([
                 html.Button('No Rotation', id='btn_no_rotation', n_clicks=0),
                 html.Button('Best Fit', id='btn_best_fit', n_clicks=0, style={'marginLeft':'8px'}),
             ], style={'marginTop':'10px'}),
+            html.Label("Filter Column", style={'marginTop':'12px', 'display':'block'}),
+            dcc.Dropdown(
+                id='filter_column',
+                options=[],
+                value=None,
+                clearable=True,
+                placeholder="Optional row filter",
+            ),
+            html.Div([
+                html.Label("Filter Values", style={'marginTop':'8px', 'display':'block'}),
+                dcc.Dropdown(
+                    id='filter_values',
+                    options=[],
+                    value=[],
+                    multi=True,
+                    placeholder="Select values to keep",
+                ),
+            ], id='filter_values_wrap'),
+            html.Div([
+                html.Label("Filter Range", style={'marginTop':'8px', 'display':'block'}),
+                dcc.RangeSlider(
+                    id='filter_range',
+                    min=0,
+                    max=1,
+                    step=0.01,
+                    value=[0, 1],
+                    marks={0: '0', 1: '1'},
+                    tooltip={"placement": "bottom", "always_visible": False},
+                ),
+            ], id='filter_range_wrap', style={'display':'none'}),
+            html.Button('Remove All Filters', id='btn_clear_filters', n_clicks=0, style={'marginTop':'10px'}),
+            html.Details([
+                html.Summary("How to read the oriented stereonet"),
+                html.P("Normal stereonet uses an equator-facing display projection. Oriented stereonet keeps the plotted points fixed and rotates the net grid to the average axis frame."),
+                html.P("The plotted points represent the same directions in both modes. What changes is the reference frame used by the grid and the 3D average-axis view."),
+                html.P("Use Best Fit to rotate the model side toward the actual P/B/T frame, then read the angle-difference summary to see the remaining mismatch."),
+            ], style={'marginTop':'12px', 'fontSize':'13px'}),
         ], style={'width': f'{PANEL_WIDTH}px', 'padding':'10px'}),
     ], style={'display':'flex', 'width': f'{FIG_WIDTH}px'}),
     dcc.Store(id='data_store'),
@@ -576,6 +921,17 @@ app.layout = html.Div([
         ),
         style={'overflowX': 'auto'}
     ),
+    html.Div(id='angle_summary', style={'padding':'10px'}),
+    html.Div([
+        dcc.Graph(
+            id='angle_pie_graph',
+            style={'height': f'{PIE_FIG_HEIGHT}px', 'width': f'{PIE_WIDTH}px', 'minWidth': f'{PIE_WIDTH}px'}
+        ),
+        dcc.Graph(
+            id='tensor_graph',
+            style={'height': f'{TENSOR_FIG_HEIGHT}px', 'width': f'{TENSOR_WIDTH}px', 'minWidth': f'{TENSOR_WIDTH}px'}
+        ),
+    ], style={'display':'flex', 'alignItems':'flex-start', 'width': f'{FIG_WIDTH}px', 'overflowX': 'auto'}),
     html.Div(id='debug', style={'display':'none'})  # for debug prints if needed
 ])
 
@@ -588,6 +944,11 @@ app.layout = html.Div([
     Output('right_mode', 'options'),
     Output('right_mode', 'value'),
     Output('page_title', 'children'),
+    Output('filter_column', 'options'),
+    Output('filter_column', 'value'),
+    Output('filter_values', 'options'),
+    Output('filter_values', 'value'),
+    Output('filter_range', 'value'),
     Input('upload_csv', 'contents'),
     State('upload_csv', 'filename'),
     prevent_initial_call=True,
@@ -595,7 +956,7 @@ app.layout = html.Div([
 def load_data(upload_contents, upload_filename):
     try:
         if not upload_contents:
-            return no_update, "No file selected.", no_update, no_update, no_update, no_update, no_update, no_update
+            return no_update, "No file selected.", no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
         header, b64 = upload_contents.split(',', 1)
         decoded = base64.b64decode(b64)
         df = pd.read_csv(StringIO(decoded.decode('utf-8', errors='replace')))
@@ -603,10 +964,11 @@ def load_data(upload_contents, upload_filename):
         source_label = upload_filename or "uploaded file"
         title = make_title(upload_filename or "")
     except Exception as exc:
-        return no_update, f"Load failed: {exc}", no_update, no_update, no_update, no_update, no_update, no_update
+        return no_update, f"Load failed: {exc}", no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update, no_update
     modes = available_right_modes(df)
     right_mode = modes[0] if modes else None
     ctx = compute_alignment_context(df, right_mode) if right_mode else BASE_ALIGN_CTX
+    filter_cols = available_filter_columns(df)
     return (
         df.to_json(date_format='iso', orient='split'),
         f"Loaded {source_label} ({len(df)} rows)",
@@ -616,7 +978,49 @@ def load_data(upload_contents, upload_filename):
         [{"label": right_mode_label(m), "value": m} for m in modes],
         right_mode,
         title,
+        filter_cols,
+        None,
+        [],
+        [],
+        [0, 1],
     )
+
+@app.callback(
+    Output('filter_values', 'options', allow_duplicate=True),
+    Output('filter_values', 'value', allow_duplicate=True),
+    Output('filter_range', 'min'),
+    Output('filter_range', 'max'),
+    Output('filter_range', 'value', allow_duplicate=True),
+    Output('filter_range', 'marks'),
+    Output('filter_range', 'step'),
+    Output('filter_values_wrap', 'style'),
+    Output('filter_range_wrap', 'style'),
+    Input('filter_column', 'value'),
+    Input('data_store', 'data'),
+    prevent_initial_call=True,
+)
+def on_filter_column_change(filter_column, data_store):
+    if not data_store:
+        return [], [], 0, 1, [0, 1], {0: '0', 1: '1'}, 0.01, {}, {'display':'none'}
+    try:
+        df = pd.read_json(StringIO(data_store), orient='split')
+    except Exception:
+        return [], [], 0, 1, [0, 1], {0: '0', 1: '1'}, 0.01, {}, {'display':'none'}
+    bounds = numeric_filter_bounds(df, filter_column)
+    if bounds is None:
+        return filter_value_options(df, filter_column), [], 0, 1, [0, 1], {0: '0', 1: '1'}, 0.01, {}, {'display':'none'}
+    min_value, max_value = bounds
+    return [], [], min_value, max_value, [min_value, max_value], slider_marks(min_value, max_value), slider_step(df, filter_column, min_value, max_value), {'display':'none'}, {}
+
+@app.callback(
+    Output('filter_column', 'value', allow_duplicate=True),
+    Input('btn_clear_filters', 'n_clicks'),
+    prevent_initial_call=True,
+)
+def clear_filters(n_clicks):
+    if not n_clicks:
+        return no_update
+    return None
 
 @app.callback(
     Output('right_trend_delta', 'value', allow_duplicate=True),
@@ -644,12 +1048,16 @@ def set_rotation_buttons(n_no, n_best, right_align_base):
     Output('right_plunge_delta', 'value', allow_duplicate=True),
     Output('right_align_base', 'data', allow_duplicate=True),
     Input('right_mode', 'value'),
+    Input('filter_column', 'value'),
+    Input('filter_values', 'value'),
+    Input('filter_range', 'value'),
     Input('data_store', 'data'),
     prevent_initial_call=True,
 )
-def on_right_mode_change(right_mode, data_store):
+def on_right_mode_change(right_mode, filter_column, filter_values, filter_range, data_store):
     if not right_mode:
         return no_update, no_update, no_update
+    triggered = dash.callback_context.triggered[0]["prop_id"].split(".")[0] if dash.callback_context.triggered else None
     try:
         if data_store:
             df = pd.read_json(StringIO(data_store), orient='split')
@@ -657,31 +1065,50 @@ def on_right_mode_change(right_mode, data_store):
             return no_update, no_update, no_update
     except Exception:
         return no_update, no_update, no_update
-    ctx = compute_alignment_context(df, right_mode)
+    filtered = apply_row_filter(df, filter_column, filter_values, filter_range)
+    if filtered is None or filtered.empty:
+        return no_update, no_update, BASE_ALIGN_CTX
+    ctx = compute_alignment_context(filtered, right_mode)
+    if triggered in {"filter_column", "filter_values", "filter_range"}:
+        return no_update, no_update, ctx
     return ctx["trend"], ctx["angle_deg"], ctx
 
 @app.callback(
     Output('stereo_graph', 'figure'),
+    Output('angle_pie_graph', 'figure'),
+    Output('tensor_graph', 'figure'),
+    Output('angle_summary', 'children'),
+    Input('net_mode', 'value'),
     Input('right_trend_delta', 'value'),
     Input('right_plunge_delta', 'value'),
     Input('right_align_base', 'data'),
     Input('right_mode', 'value'),
+    Input('filter_column', 'value'),
+    Input('filter_values', 'value'),
+    Input('filter_range', 'value'),
     Input('data_store', 'data'),
 )
-def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right_mode, data_store):
+def update_figure(net_mode, right_trend_delta, right_plunge_delta, right_align_base, right_mode, filter_column, filter_values, filter_range, data_store):
     try:
         if data_store:
             df = pd.read_json(StringIO(data_store), orient='split')
         else:
-            fig = go.Figure()
-            fig.update_layout(title="Upload a CSV to begin")
-            return fig
+            empty = empty_figure("Upload a CSV to begin")
+            return empty, empty, empty, ""
     except Exception as exc:
-        fig = go.Figure()
-        fig.update_layout(title=f"Data load error: {exc}")
-        return fig
+        message = f"Data load error: {exc}"
+        empty = empty_figure(message)
+        return empty, empty, empty, ""
 
-    avg_method = "joint_eigen"
+    total_rows = len(df)
+    filtered_df = apply_row_filter(df, filter_column, filter_values, filter_range)
+    if filtered_df is None or filtered_df.empty:
+        message = "No rows match the current filter"
+        empty = empty_figure(message)
+        return empty, empty, empty, html.Div(message, style={"padding": "10px"})
+    df = filtered_df
+
+    avg_method = "axis_axial"
     rotation = 0.0
 
     if right_trend_delta is None:
@@ -725,6 +1152,8 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     right_rot = rotation_from_pole_equator(target_pole_vec, target_equator)
     if right_rot is None:
         right_rot = np.eye(3)
+    view_matrix = DISPLAY_VIEW_MATRIX
+
     # Prepare left dataset (P, B, T axes as lines)
     p_trend = to_numeric_series(df, LEFT_COLS["p_trend"])
     p_plunge = to_numeric_series(df, LEFT_COLS["p_plunge"])
@@ -737,9 +1166,16 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     t_mask = t_trend.notna() & t_plunge.notna()
     b_mask = b_trend.notna() & b_plunge.notna()
 
-    x_p, y_p = equal_area_proj(p_trend[p_mask].to_numpy(), p_plunge[p_mask].to_numpy(), rotation_deg=rotation)
-    x_t, y_t = equal_area_proj(t_trend[t_mask].to_numpy(), t_plunge[t_mask].to_numpy(), rotation_deg=rotation)
-    x_b, y_b = equal_area_proj(b_trend[b_mask].to_numpy(), b_plunge[b_mask].to_numpy(), rotation_deg=rotation)
+    p_trend_vals = p_trend[p_mask].to_numpy()
+    p_plunge_vals = p_plunge[p_mask].to_numpy()
+    t_trend_vals = t_trend[t_mask].to_numpy()
+    t_plunge_vals = t_plunge[t_mask].to_numpy()
+    b_trend_vals = b_trend[b_mask].to_numpy()
+    b_plunge_vals = b_plunge[b_mask].to_numpy()
+
+    x_p, y_p, _, _ = trend_plunge_to_projected_xy(p_trend_vals, p_plunge_vals, rotation_deg=rotation, view_matrix=view_matrix)
+    x_t, y_t, _, _ = trend_plunge_to_projected_xy(t_trend_vals, t_plunge_vals, rotation_deg=rotation, view_matrix=view_matrix)
+    x_b, y_b, _, _ = trend_plunge_to_projected_xy(b_trend_vals, b_plunge_vals, rotation_deg=rotation, view_matrix=view_matrix)
 
     # Precompute means for labeling and options
     p_axial = axial_mean_direction(p_trend[p_mask].to_numpy(), p_plunge[p_mask].to_numpy())
@@ -749,13 +1185,15 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     t_dir = directional_mean_direction(t_trend[t_mask].to_numpy(), t_plunge[t_mask].to_numpy())
     b_dir = directional_mean_direction(b_trend[b_mask].to_numpy(), b_plunge[b_mask].to_numpy())
 
-    if avg_method == "axial_ortho":
+    p_avg = t_avg = b_avg = None
+    if avg_method == "axis_axial":
+        p_avg, t_avg, b_avg = p_axial, t_axial, b_axial
+    elif avg_method == "axial_ortho":
         p_mean, t_mean, b_mean = p_axial, t_axial, b_axial
     elif avg_method == "dir_ortho":
         p_mean, t_mean, b_mean = p_dir, t_dir, b_dir
     else:
         p_mean = t_mean = b_mean = None
-    p_avg = t_avg = b_avg = None
     if avg_method in ("axial_ortho", "dir_ortho") and p_mean is not None and t_mean is not None and b_mean is not None:
         p_avg, t_avg, b_avg = orthonormalize_triad(p_mean, t_mean, b_mean)
         p_avg = force_lower_hemisphere(p_avg)
@@ -776,9 +1214,15 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     # Prepare right dataset (three trend/plunge pairs per row)
     right_cols = right_cols_for_prefix(df, right_mode or DEFAULT_RIGHT_MODE)
     right_sets = []
+    row_angle_parts = []
     if right_cols is None:
         right_cols = []
-    for dipdir_col, dip_col in right_cols:
+    left_pairs = [
+        (p_trend, p_plunge),
+        (b_trend, b_plunge),
+        (t_trend, t_plunge),
+    ]
+    for idx, (dipdir_col, dip_col) in enumerate(right_cols):
         trend = to_numeric_series(df, dipdir_col)
         plunge = to_numeric_series(df, dip_col)
         mask = trend.notna() & plunge.notna()
@@ -788,20 +1232,45 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
                 plunge[mask].to_numpy(),
                 right_rot,
             )
-            x, y = equal_area_proj(tr_rot, pl_rot, rotation_deg=rotation)
+            x, y, _, _ = trend_plunge_to_projected_xy(tr_rot, pl_rot, rotation_deg=rotation, view_matrix=view_matrix)
         else:
+            tr_rot, pl_rot = np.array([]), np.array([])
             x, y = np.array([]), np.array([])
-        right_sets.append((dipdir_col, dip_col, trend, plunge, mask, x, y))
+        right_sets.append((dipdir_col, dip_col, trend, plunge, mask, tr_rot, pl_rot, x, y))
+        if idx < len(left_pairs):
+            left_trend, left_plunge = left_pairs[idx]
+            pair_mask = left_trend.notna() & left_plunge.notna() & mask
+            pair_angles = pd.Series(np.nan, index=df.index, dtype=float)
+            if pair_mask.any():
+                pair_tr_rot, pair_pl_rot = rotate_trend_plunge(
+                    trend[pair_mask].to_numpy(),
+                    plunge[pair_mask].to_numpy(),
+                    right_rot,
+                )
+                pair_angles.loc[pair_mask] = acute_angle_difference_array(
+                    left_trend[pair_mask].to_numpy(),
+                    left_plunge[pair_mask].to_numpy(),
+                    pair_tr_rot,
+                    pair_pl_rot,
+                )
+            row_angle_parts.append(pair_angles)
+
+    if row_angle_parts:
+        row_angles = pd.concat(row_angle_parts, axis=1).mean(axis=1, skipna=True).dropna().to_numpy()
+    else:
+        row_angles = np.array([])
 
     # Average E1/E2/E3 directions
     e_means = []
-    for dipdir_col, dip_col, trend, plunge, mask, _, _ in right_sets:
+    for dipdir_col, dip_col, trend, plunge, mask, _, _, _, _ in right_sets:
         e_means.append(axial_mean_direction(trend[mask].to_numpy(), plunge[mask].to_numpy()))
     e_dir_means = []
-    for dipdir_col, dip_col, trend, plunge, mask, _, _ in right_sets:
+    for dipdir_col, dip_col, trend, plunge, mask, _, _, _, _ in right_sets:
         e_dir_means.append(directional_mean_direction(trend[mask].to_numpy(), plunge[mask].to_numpy()))
     e_avg = [None, None, None]
-    if avg_method in ("axial_ortho", "dir_ortho"):
+    if avg_method == "axis_axial":
+        e_avg = e_means
+    elif avg_method in ("axial_ortho", "dir_ortho"):
         means = e_means if avg_method == "axial_ortho" else e_dir_means
         if all(v is not None for v in means):
             e_avg[0], e_avg[1], e_avg[2] = orthonormalize_triad(means[0], means[1], means[2])
@@ -830,7 +1299,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     fig = make_subplots(
         rows=1,
         cols=2,
-        subplot_titles=("P/B/T Axes (Trends/Plunges)", f"{right_title} (Trends/Plunges)"),
+        subplot_titles=("Actual P/B/T (Trend/Plunge)", f"Model {right_title} (Trend/Plunge)"),
         horizontal_spacing=H_SPACING
     )
     # common background circle for stereonet
@@ -839,8 +1308,12 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     circle_y = np.cos(circle_theta)
 
     # Grid rotations: align with averages if available
-    grid_rot_left = rotation_from_pole_equator(p_avg, t_avg) if (p_avg is not None and t_avg is not None) else None
-    grid_rot_right = rotation_from_pole_equator(e_avg_rot[0], e_avg_rot[1]) if (e_avg_rot[0] is not None and e_avg_rot[1] is not None) else None
+    if net_mode == "oriented":
+        grid_rot_left = rotation_from_pole_equator(p_avg, t_avg) if (p_avg is not None and t_avg is not None) else None
+        grid_rot_right = rotation_from_pole_equator(e_avg_rot[0], e_avg_rot[1]) if (e_avg_rot[0] is not None and e_avg_rot[1] is not None) else None
+    else:
+        grid_rot_left = None
+        grid_rot_right = None
 
     # Add grid lines (rotated Schmidt net) every 10°
     grid_angles = np.arange(0, 360, 10)
@@ -854,7 +1327,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
         trend_samples = np.linspace(0, 360, 181)
         for plunge in plunge_circles:
             t = np.full_like(trend_samples, plunge)
-            xg, yg = project_rotated_grid(trend_samples, t, rotation, rot_matrix)
+            xg, yg = project_rotated_grid(trend_samples, t, rotation, rot_matrix, view_matrix=view_matrix)
             is_equator = abs(plunge) < 1e-6
             fig.add_trace(
                 go.Scatter(
@@ -864,7 +1337,8 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
                         width=1.4 if is_equator else 1.0,
                         dash=None if is_equator else 'dot'
                     ),
-                    showlegend=False
+                    showlegend=False,
+                    hoverinfo='skip',
                 ),
                 row=row, col=col
             )
@@ -872,11 +1346,12 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
         plunge_samples = np.linspace(-90, 90, 121)
         for trend in grid_angles:
             tr = np.full_like(plunge_samples, trend)
-            xg, yg = project_rotated_grid(tr, plunge_samples, rotation, rot_matrix)
+            xg, yg = project_rotated_grid(tr, plunge_samples, rotation, rot_matrix, view_matrix=view_matrix)
             fig.add_trace(
                 go.Scatter(x=xg, y=yg, mode='lines',
                            line=dict(color=grid_color, width=1, dash='dot'),
-                           showlegend=False),
+                           showlegend=False,
+                           hoverinfo='skip'),
                 row=row, col=col
             )
 
@@ -884,25 +1359,45 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
     add_rotated_grid(grid_rot_right, row=1, col=2)
 
     # Left: P/B/T axes
-    fig.add_trace(go.Scatter(x=circle_x, y=circle_y, mode='lines', line=dict(color='black'), showlegend=False), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x_p, y=y_p, mode='markers', marker=dict(size=6, color='#1f77b4', opacity=0.7),
-                             name='P-Axis', legendrank=10), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x_b, y=y_b, mode='markers', marker=dict(size=6, color='#2ca02c', opacity=0.7),
-                             name='B-Axis', legendrank=50), row=1, col=1)
-    fig.add_trace(go.Scatter(x=x_t, y=y_t, mode='markers', marker=dict(size=6, color='#ff7f0e', opacity=0.7),
-                             name='T-Axis', legendrank=90), row=1, col=1)
+    fig.add_trace(go.Scatter(x=circle_x, y=circle_y, mode='lines', line=dict(color='black'), showlegend=False, hoverinfo='skip'), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=x_p, y=y_p, mode='markers',
+        marker=dict(size=6, color=LEFT_AXIS_COLORS["P"], opacity=0.7),
+        name='P-Axis',
+        legendrank=10,
+        customdata=customdata_from_trend_plunge(p_trend_vals, p_plunge_vals),
+        hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>P-Axis</extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=x_b, y=y_b, mode='markers',
+        marker=dict(size=6, color=LEFT_AXIS_COLORS["B"], opacity=0.7),
+        name='B-Axis',
+        legendrank=50,
+        customdata=customdata_from_trend_plunge(b_trend_vals, b_plunge_vals),
+        hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>B-Axis</extra>",
+    ), row=1, col=1)
+    fig.add_trace(go.Scatter(
+        x=x_t, y=y_t, mode='markers',
+        marker=dict(size=6, color=LEFT_AXIS_COLORS["T"], opacity=0.7),
+        name='T-Axis',
+        legendrank=90,
+        customdata=customdata_from_trend_plunge(t_trend_vals, t_plunge_vals),
+        hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>T-Axis</extra>",
+    ), row=1, col=1)
 
-    right_label = right_mode or DEFAULT_RIGHT_MODE
+    right_label = right_mode or "R"
     # Right: EDip/SDip points
-    fig.add_trace(go.Scatter(x=circle_x, y=circle_y, mode='lines', line=dict(color='black'), showlegend=False), row=1, col=2)
+    fig.add_trace(go.Scatter(x=circle_x, y=circle_y, mode='lines', line=dict(color='black'), showlegend=False, hoverinfo='skip'), row=1, col=2)
     colors = RIGHT_AXIS_COLORS
-    for idx, (dipdir_col, dip_col, _, _, _, x, y) in enumerate(right_sets, start=1):
+    for idx, (dipdir_col, dip_col, _, _, _, tr_rot, pl_rot, x, y) in enumerate(right_sets, start=1):
         label = f"{right_label}{idx}"
         rank = RIGHT_AXIS_RANKS.get(idx, 200 + idx)
         fig.add_trace(go.Scatter(x=x, y=y, mode='markers',
                                  marker=dict(size=6, color=colors[idx-1], opacity=0.7),
                                  name=label,
-                                 legendrank=rank), row=1, col=2)
+                                 legendrank=rank,
+                                 customdata=customdata_from_trend_plunge(tr_rot, pl_rot),
+                                 hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>" + label + "</extra>"), row=1, col=2)
 
     # Average markers (orthonormal triads)
     avg_marker_size = 17
@@ -911,28 +1406,40 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
         p_tr, p_pl = vector_to_trend_plunge(*p_avg)
         t_tr, t_pl = vector_to_trend_plunge(*t_avg)
         b_tr, b_pl = vector_to_trend_plunge(*b_avg)
-        xp, yp = equal_area_proj(p_tr, p_pl, rotation_deg=rotation)
-        xt, yt = equal_area_proj(t_tr, t_pl, rotation_deg=rotation)
-        xb, yb = equal_area_proj(b_tr, b_pl, rotation_deg=rotation)
+        xp, yp, _, _ = trend_plunge_to_projected_xy([p_tr], [p_pl], rotation_deg=rotation, view_matrix=view_matrix)
+        xt, yt, _, _ = trend_plunge_to_projected_xy([t_tr], [t_pl], rotation_deg=rotation, view_matrix=view_matrix)
+        xb, yb, _, _ = trend_plunge_to_projected_xy([b_tr], [b_pl], rotation_deg=rotation, view_matrix=view_matrix)
+        xp, yp = xp[0], yp[0]
+        xt, yt = xt[0], yt[0]
+        xb, yb = xb[0], yb[0]
         fig.add_trace(go.Scatter(x=[xp], y=[yp], mode='markers',
-                                 marker=dict(size=avg_marker_size, color='#1f77b4', symbol='circle', line=avg_marker_line),
-                                 name='P-Axis Avg', legendrank=20), row=1, col=1)
+                                 marker=dict(size=avg_marker_size, color=LEFT_AXIS_COLORS["P"], symbol='circle', line=avg_marker_line),
+                                 name='P-Axis Avg', legendrank=20,
+                                 customdata=customdata_from_trend_plunge([p_tr], [p_pl]),
+                                 hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>P-Axis Avg</extra>"), row=1, col=1)
         fig.add_trace(go.Scatter(x=[xb], y=[yb], mode='markers',
-                                 marker=dict(size=avg_marker_size, color='#2ca02c', symbol='circle', line=avg_marker_line),
-                                 name='B-Axis Avg', legendrank=60), row=1, col=1)
+                                 marker=dict(size=avg_marker_size, color=LEFT_AXIS_COLORS["B"], symbol='circle', line=avg_marker_line),
+                                 name='B-Axis Avg', legendrank=60,
+                                 customdata=customdata_from_trend_plunge([b_tr], [b_pl]),
+                                 hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>B-Axis Avg</extra>"), row=1, col=1)
         fig.add_trace(go.Scatter(x=[xt], y=[yt], mode='markers',
-                                 marker=dict(size=avg_marker_size, color='#ff7f0e', symbol='circle', line=avg_marker_line),
-                                 name='T-Axis Avg', legendrank=100), row=1, col=1)
+                                 marker=dict(size=avg_marker_size, color=LEFT_AXIS_COLORS["T"], symbol='circle', line=avg_marker_line),
+                                 name='T-Axis Avg', legendrank=100,
+                                 customdata=customdata_from_trend_plunge([t_tr], [t_pl]),
+                                 hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>T-Axis Avg</extra>"), row=1, col=1)
 
     if all(v is not None for v in e_avg_rot):
         for idx, v in enumerate(e_avg_rot, start=1):
             tr, pl = vector_to_trend_plunge(*v)
-            x, y = equal_area_proj(tr, pl, rotation_deg=rotation)
+            x, y, _, _ = trend_plunge_to_projected_xy([tr], [pl], rotation_deg=rotation, view_matrix=view_matrix)
+            x, y = x[0], y[0]
             rank = (RIGHT_AXIS_RANKS.get(idx, 200 + idx) + 10)
             fig.add_trace(go.Scatter(x=[x], y=[y], mode='markers',
                                      marker=dict(size=avg_marker_size, color=colors[idx-1], symbol='circle', line=avg_marker_line),
                                      name=f"{right_label}{idx} Avg",
-                                     legendrank=rank), row=1, col=2)
+                                     legendrank=rank,
+                                     customdata=customdata_from_trend_plunge([tr], [pl]),
+                                     hovertemplate="Trend: %{customdata[0]:.1f}°<br>Plunge: %{customdata[1]:.1f}°<extra>" + f"{right_label}{idx} Avg" + "</extra>"), row=1, col=2)
 
     # layout cosmetics
     fig.update_xaxes(range=[-1.05,1.05], zeroline=False, showticklabels=False, row=1, col=1, constrain='domain')
@@ -945,6 +1452,7 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
         height=FIG_HEIGHT,
         width=FIG_WIDTH,
         margin=PLOT_MARGIN,
+        hovermode='closest',
         showlegend=True,
         legend=dict(
             title=dict(text='Legend', side='top'),
@@ -959,7 +1467,13 @@ def update_figure(right_trend_delta, right_plunge_delta, right_align_base, right
         )
     )
 
-    return fig
+    left_vectors = [p_avg, b_avg, t_avg]
+    right_vectors = [e_avg_rot[0], e_avg_rot[1], e_avg_rot[2]]
+    angle_summary = build_angle_summary(left_vectors, right_vectors, right_label, len(df), total_rows)
+    angle_pie_fig = build_angle_pie_figure(row_angles)
+    tensor_fig = build_tensor_figure(left_vectors, right_vectors, right_label)
+
+    return fig, angle_pie_fig, tensor_fig, angle_summary
 
 if __name__ == '__main__':
     app.run(debug=True, port=8050)
