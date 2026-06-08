@@ -91,9 +91,20 @@ Notes:
 
 ---
 
+**Render.com Deployment**
+
+A `render.yaml` is included for one-click deployment on Render.com.
+- **Build command:** `pip install -r requirements.txt`
+- **Start command:** `gunicorn --bind 0.0.0.0:$PORT stereonet_app:server`
+
+The app reads the `PORT` environment variable automatically; Render sets this at runtime.
+
+---
+
 **Key Files**
 - `stereonet_app.py`: Dash app and all logic.
 - `requirements.txt`: Python dependencies.
+- `render.yaml`: Render.com service configuration.
 
 ---
 
