@@ -20,16 +20,41 @@ This README is written for:
 ---
 
 **Quick Start**
-1. Install dependencies:
+1. Create a local virtual environment and install dependencies:
 ```bash
-pip install -r requirements.txt
+bash scripts/bootstrap.sh
 ```
-2. Run the app:
+2. Activate the environment:
+```bash
+source .venv/bin/activate
+```
+3. Run the app:
 ```bash
 python stereonet_app.py
 ```
-3. Open the URL printed in the console (default `http://127.0.0.1:8050`).
-4. Use the **Browse...** button to upload a CSV. There is no default file.
+4. Open the URL printed in the console (default `http://127.0.0.1:8050`).
+5. Use the **Browse...** button to upload a CSV. There is no default file.
+
+If your system does not provide `python`, use `.venv/bin/python stereonet_app.py` or `python3 stereonet_app.py`.
+
+The repository includes `2025_Stereo.csv` as a sample input file you can upload after launch.
+
+---
+
+**VS Code**
+- The repo includes `.vscode/` config for the local `.venv`.
+- Run **Bootstrap environment** once from the command palette or terminal.
+- Then use the **Run stereonet app** launch configuration or task.
+
+---
+
+**Docker**
+Build and run without a local Python environment:
+
+```bash
+docker build -t stereonet-app .
+docker run --rm -p 8050:8050 stereonet-app
+```
 
 ---
 

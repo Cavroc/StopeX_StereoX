@@ -1,0 +1,16 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Run stereonet app",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/stereonet_app.py",
+      "console": "integratedTerminal",
+      "cwd": "${workspaceFolder}",
+      "env": {
+        "PORT": "8050"
+      }
+    }
+  ]
+}
