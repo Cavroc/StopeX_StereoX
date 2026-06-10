@@ -2,6 +2,8 @@
 
 Interactive Dash app to compare left-side P/B/T axes against right-side E (strain) or S (stress) axes on dual stereonets.
 
+An instance of this app is running on https://stopex-stereox.onrender.com/
+
 This README is written for:
 1. Power users and programmers who will run or extend the app.
 2. AI agents who may pick this up later.
